@@ -1,0 +1,24 @@
+[project]
+name = "cacheblend-val"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.13.0",
+    "jsonlines>=4.0.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "pandas>=3.0.2",
+    "pytest>=9.0.3",
+    "rouge-score>=0.1.2",
+    "torch==2.2.2 ; platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "torch>=2.4 ; platform_machine != 'x86_64' or sys_platform != 'darwin'",
+    "transformers>=4.44,<4.50",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "ipython>=9.10.1",
+]

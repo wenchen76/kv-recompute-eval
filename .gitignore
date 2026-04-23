@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+
+# Tooling caches
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Claude Code local (machine-specific) settings; shared .claude/settings.json still tracked
+.claude/settings.local.json
+
+# Project-local planning doc, not shared
+cacheblend_validation_plan.md
