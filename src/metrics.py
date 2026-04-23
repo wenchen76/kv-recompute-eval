@@ -27,38 +27,31 @@ def _mean_nll(logits: torch.Tensor, labels: torch.Tensor) -> float:
 @torch.no_grad()
 def compute_answer_ppl(
     model,
-    prompt_ids: torch.Tensor,
+    prompt_last_token: torch.Tensor,
     answer_ids: torch.Tensor,
     past_kv,
 ) -> float:
     """Mean NLL over all L answer tokens, given a cache prefilled on prompt[:, :-1].
 
     Args:
-        prompt_ids: [B, P] full prompt (all P tokens; we slice [-1] internally).
+        prompt_last_token: [B, 1] — the held-back last prompt token.
         answer_ids: [B, L] answer.
-        past_kv: DynamicCache of length ``P - 1`` — produced by
+        past_kv: DynamicCache of length ``prompt_len - 1`` — produced by
             ``prefill_gold(model, prompt_ids[:, :-1])``. Deep-copied before use so the
             caller's cache is not mutated by the in-place append inside the model.
 
     Returns:
         mean NLL (nats) over answer[0..L-1]. log(PPL) == mean NLL.
     """
-    P = prompt_ids.shape[1]
+    prefix_len = past_kv.get_seq_length() + 1  # position count including prompt_last_token
     L = answer_ids.shape[1]
-    assert P >= 1 and L >= 1
+    assert prefix_len >= 1 and L >= 1
 
-    cached_len = past_kv.key_cache[0].shape[-2]
-    assert cached_len == P - 1, (
-        f"past_kv has length {cached_len}, expected {P - 1}. "
-        "Call prefill_gold(model, prompt_ids[:, :-1]) to produce it."
-    )
+    decode_input = torch.cat([prompt_last_token, answer_ids], dim=1)  # [B, L+1]
 
-    last_prefix = prompt_ids[:, -1:]                              # [B, 1]
-    decode_input = torch.cat([last_prefix, answer_ids], dim=1)    # [B, L+1]
-
-    # Global positions: last prefix token sits at P-1, then answer at P..P+L-1.
+    # Global positions: last prompt token sits at prefix_len-1, then answer follows.
     position_ids = torch.arange(
-        P - 1, P + L, device=prompt_ids.device
+        prefix_len - 1, prefix_len + L, device=prompt_last_token.device
     ).unsqueeze(0)
 
     kv = copy.deepcopy(past_kv)

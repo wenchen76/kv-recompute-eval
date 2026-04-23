@@ -24,7 +24,12 @@ def test_full_forward_matches_prefill_decode(loaded_model, prompt_answer_ids):
     # prefill one token short, then compute_answer_ppl prepends prompt[-1] to the decode
     # input so every answer token — including answer[0] — has a predicting logit.
     past_kv = prefill_gold(model, prompt_ids[:, :-1])
-    nll_prefill = compute_answer_ppl(model, prompt_ids, answer_ids, past_kv)
+    nll_prefill = compute_answer_ppl(
+        model,
+        prompt_last_token=prompt_ids[:, -1:],
+        answer_ids=answer_ids,
+        past_kv=past_kv,
+    )
 
     assert nll_full == pytest.approx(nll_prefill, abs=PPL_TOL), (
         f"full-forward NLL {nll_full:.6f} vs prefill+decode NLL {nll_prefill:.6f}; "
