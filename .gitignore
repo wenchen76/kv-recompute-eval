@@ -20,4 +20,4 @@ wheels/
 .claude/settings.local.json
 
 # Project-local planning doc, not shared
-cacheblend_validation_plan.md
+plan.md

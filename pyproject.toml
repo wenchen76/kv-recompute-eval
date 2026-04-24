@@ -1,5 +1,5 @@
 [project]
-name = "cacheblend-val"
+name = "kv-recompute-eval"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
