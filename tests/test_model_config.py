@@ -11,7 +11,7 @@ EXPECTED_CONFIGS = {
         "head_dim": 64,
         "rope_theta": 500000.0,
         "rope_type": "llama3",
-        "rope_factor": 8.0,
+        "rope_factor": 32.0,
         "rope_original_max_pos": 8192,
     },
     "meta-llama/Llama-3.1-8B-Instruct": {
