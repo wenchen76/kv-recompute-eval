@@ -1,12 +1,13 @@
 """KV cache manipulation primitives.
 
-Phase 2 only needs ``concat_per_chunk_kvs`` — assemble the stale prefix cache by
-concatenating per-chunk DynamicCache objects along the sequence dimension. Phase 3
-adds ``mix_kv`` (selective positions from gold vs stale).
+* ``concat_per_chunk_kvs`` — assemble the stale prefix cache by concatenating
+  per-chunk DynamicCache objects along the sequence dimension (Phase 2).
+* ``mix_kv`` — build a hybrid prefix: positions in ``selected_positions`` sourced
+  from gold, everything else from stale (Phase 3).
 """
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Sequence, Set
 
 import torch
 from transformers import DynamicCache
@@ -74,4 +75,68 @@ def concat_per_chunk_kvs(
             total_len = merged.key_cache[0].shape[-2]
 
     merged._seen_tokens = total_len
+    return merged
+
+
+def mix_kv(
+    kv_gold: DynamicCache,
+    kv_stale: DynamicCache,
+    selected_positions: Set[int],
+    model_config,
+) -> DynamicCache:
+    """Build a hybrid prefix cache: positions in ``selected_positions`` sourced
+    from ``kv_gold``, everything else from ``kv_stale``. Shared selection across
+    all layers (per Phase 3 simplified HKVD — paper insight that early-layer
+    divergence ranking correlates well with later layers).
+
+    Sanity endpoints (Phase 3 tests assert these):
+    * empty selection → output is bit-equal to ``kv_stale``,
+    * full selection → output is bit-equal to ``kv_gold``.
+
+    Args:
+        kv_gold: full gold prefix cache (prefill on cat(sys, chunks)).
+        kv_stale: stale prefix cache (concat of per-chunk prefills).
+            Must cover the same sequence range as ``kv_gold``.
+        selected_positions: global positions in ``[0, prefix_len)`` drawn from
+            gold. Positions in the sys range are a no-op since sys KV is
+            identical under both paths (sys has no prior context to attend to),
+            but they're accepted — the caller doesn't have to special-case sys.
+        model_config: model.config, for n_layers.
+
+    Returns:
+        DynamicCache with per-layer K,V of the shared prefix_len. Deep copy
+        (via torch.where); mutating the result does not alias the inputs.
+    """
+    L_gold = kv_gold.get_seq_length()
+    L_stale = kv_stale.get_seq_length()
+    assert L_gold == L_stale, f"mix_kv: gold len {L_gold} != stale len {L_stale}"
+    L = L_gold
+    n_layers = model_config.num_hidden_layers
+
+    device = kv_gold.key_cache[0].device
+    mask = torch.zeros(L, dtype=torch.bool, device=device)
+    if selected_positions:
+        idx_list = sorted(selected_positions)
+        assert idx_list[0] >= 0 and idx_list[-1] < L, (
+            f"mix_kv: selected positions out of range [0, {L}): "
+            f"min={idx_list[0]}, max={idx_list[-1]}"
+        )
+        idx = torch.tensor(idx_list, dtype=torch.long, device=device)
+        mask[idx] = True
+    # [1, 1, L, 1] broadcasts against K/V [B, n_kv_heads, L, head_dim].
+    mask_b = mask.view(1, 1, L, 1)
+
+    merged = DynamicCache()
+    for li in range(n_layers):
+        kg, vg = kv_gold.key_cache[li], kv_gold.value_cache[li]
+        ks, vs = kv_stale.key_cache[li], kv_stale.value_cache[li]
+        assert kg.shape == ks.shape, (
+            f"layer {li}: gold K shape {tuple(kg.shape)} != stale {tuple(ks.shape)}"
+        )
+        assert vg.shape == vs.shape, (
+            f"layer {li}: gold V shape {tuple(vg.shape)} != stale {tuple(vs.shape)}"
+        )
+        merged.key_cache.append(torch.where(mask_b, kg, ks))
+        merged.value_cache.append(torch.where(mask_b, vg, vs))
+    merged._seen_tokens = L
     return merged

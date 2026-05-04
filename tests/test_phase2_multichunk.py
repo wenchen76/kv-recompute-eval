@@ -7,7 +7,7 @@ date + chunk_2's content) degrades. Gates:
 
 * (c) Shape consistency — per-layer stale prefix K/V shape == gold prefix K/V
   shape, and total seq length == len(sys) + sum(len(chunk_i)).
-* (b) PPL sanity —
+* (b) PPL sanity — 
     - both NLLs finite, both PPLs positive,
     - ``ppl_stale >= ppl_gold`` (staleness never helps),
     - ``ppl_stale / ppl_gold < 10x`` — a blow-up past this is almost always a
