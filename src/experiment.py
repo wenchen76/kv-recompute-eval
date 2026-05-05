@@ -119,8 +119,8 @@ def run_hybrid(
     * ``r=0`` → empty selection → hybrid == stale → ppl_hybrid == ppl_stale.
     * ``r=1`` → full selection → hybrid == gold → ppl_hybrid == ppl_gold.
 
-    Note: step 2 builds the full gold prefix so ``select_hkvd_layer0`` can read
-    layer-0 K divergence. For strategies that don't need it (``random`` /
+    Note: step 2 builds the full gold prefix so ``select_hkvd_first_layer`` can
+    read layer-1 K divergence. For strategies that don't need it (``random`` /
     ``first_r``) this is wasted work, but Phase 3 lives on a single dev instance
     and correctness beats micro-optimization here.
     """

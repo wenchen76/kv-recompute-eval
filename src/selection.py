@@ -9,7 +9,7 @@ paths, so it's a no-op either way and it keeps the selection scope honest.
   real strategies can't beat this, something is broken.
 * ``select_first_r_per_chunk`` — first r-fraction of each chunk. No model
   forward needed; cheap.
-* ``select_hkvd_layer0`` — top-r% by layer-0 K-divergence. Simplified
+* ``select_hkvd_first_layer`` — top-r% by layer-1 K-divergence. Simplified
   CacheBlend (paper observation: early-layer divergence ranking correlates
   highly with later layers, so one shared selection across layers works).
 
@@ -73,18 +73,25 @@ def select_first_r_per_chunk(
 
 
 @torch.no_grad()
-def select_hkvd_layer0(
+def select_hkvd_first_layer(
     kv_gold: DynamicCache,
     kv_stale: DynamicCache,
     chunk_range: tuple[int, int],
     r: float,
-    *,
-    layer_idx: int = 0,
 ) -> set[int]:
-    """Top-r% positions by K divergence at ``layer_idx`` (default 0).
+    """Top-r% positions by layer-1 K divergence — the earliest layer that
+    carries actual staleness signal.
 
     Divergence per position = L2 norm over batch × n_kv_heads × head_dim of
-    ``(K_gold - K_stale)``. Same selection used across all layers.
+    ``(K_gold - K_stale)``. Same selection reused across all layers (paper
+    insight: early-layer ranking correlates with later layers).
+
+    **Why layer 1, not layer 0**: layer 0's K is purely a function of the
+    token embedding and global position (no attention has happened yet), so
+    K_gold ≡ K_stale at layer 0 up to fp noise (~1e-7). Ranking on noise
+    selects garbage. Layer 1 is the first layer whose K depends on the
+    layer-0 *attention* output, which is where stale (chunk-local attention)
+    starts to diverge from gold (full-prefix attention).
 
     Cast to fp32 before the squared sum so the norm doesn't under/overflow on
     bf16 / fp16 caches — the ranking is what matters, not the absolute value.
@@ -97,8 +104,8 @@ def select_hkvd_layer0(
     if k == n_total:
         return set(range(start, end))
 
-    k_gold = kv_gold.key_cache[layer_idx][:, :, start:end, :]   # [B, H, L_c, D]
-    k_stale = kv_stale.key_cache[layer_idx][:, :, start:end, :]
+    k_gold = kv_gold.key_cache[1][:, :, start:end, :]   # [B, H, L_c, D]
+    k_stale = kv_stale.key_cache[1][:, :, start:end, :]
     diff = (k_gold - k_stale).float()
     # L2 per position = sqrt(sum over B, H, D of squared diff). sqrt is
     # monotonic so topk on the squared sum would give the same ranking, but
@@ -131,5 +138,5 @@ def select_positions(
         assert kv_gold is not None and kv_stale is not None, (
             "hkvd selection needs kv_gold and kv_stale"
         )
-        return select_hkvd_layer0(kv_gold, kv_stale, chunk_range, r)
+        return select_hkvd_first_layer(kv_gold, kv_stale, chunk_range, r)
     raise ValueError(f"unknown strategy: {strategy!r}")

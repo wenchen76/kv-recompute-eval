@@ -18,6 +18,10 @@ wheels/
 
 # Claude Code local (machine-specific) settings; shared .claude/settings.json still tracked
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Project-local planning doc, not shared
 plan.md
+
+# Generated sweep outputs
+results/
