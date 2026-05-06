@@ -138,10 +138,22 @@ def _summarize(rows: list[dict]) -> dict:
     return {"cells": cells}
 
 
+# Canonical HKVD strategy used for the GO gate. We picked ``hkvd_gradual``
+# (CacheBlend Fig. 9 multi-layer narrowing filter) over the simpler
+# ``hkvd_first_layer`` because the 50-instance 1B sweep showed it dominates
+# at every r — most notably at r=0.05 (0.725 vs 0.516) and r=0.20 (0.817 vs
+# 0.776). Both at r=0.50 are tied (~0.945). Update this if a future variant
+# beats it on the same comparable-budget basis.
+GO_STRATEGY = "hkvd_gradual"
+
+
 def _decision(summary: dict) -> str:
     """Three independent gates per plan.md Phase 5.4:
 
-    * **GO** — hkvd @ r=15% mean recovery ≥ 0.90 (validates the strategy).
+    * **GO** — ``GO_STRATEGY`` @ r=15% mean recovery ≥ 0.90 (validates the
+      strategy we're trusting). Pinned to the canonical HKVD variant so a
+      sweep that includes both ``hkvd`` and ``hkvd_gradual`` doesn't fall
+      back to whichever name happens to be listed first.
     * **NO-GO** — even the best strategy at r=50% fails to recover ≥ 0.50;
       means the task is too hard for any selection budget or the stale-path
       implementation is broken. Tested on best-of, not any-of: random often
@@ -150,10 +162,10 @@ def _decision(summary: dict) -> str:
       stress cross-chunk attention.
 
     Missing cells (e.g. trimmed r grid) yield ``INCONCLUSIVE`` rather than
-    silently being treated as NO-GO.
+    silently being treated as NOT-GO.
     """
     by_cell = {(c["strategy"], c["r"]): c for c in summary["cells"]}
-    hkvd_015 = by_cell.get(("hkvd", 0.15), {}).get("mean_recovery")
+    go_015 = by_cell.get((GO_STRATEGY, 0.15), {}).get("mean_recovery")
     random_015 = by_cell.get(("random", 0.15), {}).get("mean_recovery")
     r50_by_strategy = {
         c["strategy"]: c["mean_recovery"]
@@ -163,13 +175,13 @@ def _decision(summary: dict) -> str:
 
     flags: list[str] = []
 
-    # Gate 1: GO — does HKVD reach the 0.90 bar at low budget.
-    if hkvd_015 is None:
-        flags.append("INCONCLUSIVE: no hkvd @ r=0.15 cell in sweep.")
-    elif hkvd_015 >= 0.90:
-        flags.append(f"GO: hkvd @ r=15% mean recovery {hkvd_015:.3f} ≥ 0.90.")
+    # Gate 1: GO — does the canonical HKVD strategy reach 0.90 at r=15%.
+    if go_015 is None:
+        flags.append(f"INCONCLUSIVE: no {GO_STRATEGY} @ r=0.15 cell in sweep.")
+    elif go_015 >= 0.90:
+        flags.append(f"GO: {GO_STRATEGY} @ r=15% mean recovery {go_015:.3f} ≥ 0.90.")
     else:
-        flags.append(f"NOT-GO: hkvd @ r=15% mean recovery {hkvd_015:.3f} < 0.90.")
+        flags.append(f"NOT-GO: {GO_STRATEGY} @ r=15% mean recovery {go_015:.3f} < 0.90.")
 
     # Gate 2: NO-GO — best-of-strategies at r=50% can't clear 0.50.
     if r50_by_strategy:
