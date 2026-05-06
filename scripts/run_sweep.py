@@ -41,8 +41,9 @@ from src.prefill import online_prefill, prefill_chunk, prefill_gold
 from src.selection import select_positions
 
 
-DEFAULT_R_VALUES = [0.0, 0.05, 0.10, 0.15, 0.20, 0.50, 1.0]
+DEFAULT_R_VALUES = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 1.0]
 DEFAULT_STRATEGIES = ["random", "first_r", "hkvd", "hkvd_gradual"]
+DEFAULT_DATASET = ROOT / "data" / "synthetic_qa.jsonl"
 
 
 def _ppl(nll: float) -> float:
@@ -259,7 +260,7 @@ def _write_plot(path: Path, rows: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="data/synthetic_qa.jsonl")
+    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--max-instances", type=int, default=None)
     parser.add_argument("--r-values", nargs="*", type=float, default=DEFAULT_R_VALUES)
