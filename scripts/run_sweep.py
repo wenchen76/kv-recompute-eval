@@ -118,90 +118,39 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def _summarize(rows: list[dict]) -> dict:
+    """Aggregate per-cell metrics. Recovery is ratio-of-means, not mean-of-ratios.
+
+    RoM: ``(mean(ppl_stale) - mean(ppl_hybrid)) / (mean(ppl_stale) - mean(ppl_gold))``.
+    The MoR alternative (averaging per-instance recoveries) is unstable when
+    individual ``ppl_stale - ppl_gold`` denominators are small: a few near-zero
+    gaps produce huge ratios that dominate the mean. RoM keeps the aggregate in
+    [0, 1] under PPL monotonicity.
+    """
     grouped: dict[tuple[str, float], list[dict]] = defaultdict(list)
     for row in rows:
         grouped[(row["strategy"], row["r"])].append(row)
 
     cells = []
     for (strategy, r), group in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1])):
-        recoveries = [g["recovery"] for g in group if g["recovery"] is not None]
+        mean_ppl_gold = statistics.fmean(g["ppl_gold"] for g in group)
+        mean_ppl_stale = statistics.fmean(g["ppl_stale"] for g in group)
+        mean_ppl_hybrid = statistics.fmean(g["ppl_hybrid"] for g in group)
+        denom = mean_ppl_stale - mean_ppl_gold
+        mean_recovery = (
+            (mean_ppl_stale - mean_ppl_hybrid) / denom if abs(denom) > 1e-12 else None
+        )
         cells.append(
             {
                 "strategy": strategy,
                 "r": r,
                 "n": len(group),
-                "mean_ppl_gold": statistics.fmean(g["ppl_gold"] for g in group),
-                "mean_ppl_stale": statistics.fmean(g["ppl_stale"] for g in group),
-                "mean_ppl_hybrid": statistics.fmean(g["ppl_hybrid"] for g in group),
-                "mean_recovery": statistics.fmean(recoveries) if recoveries else None,
+                "mean_ppl_gold": mean_ppl_gold,
+                "mean_ppl_stale": mean_ppl_stale,
+                "mean_ppl_hybrid": mean_ppl_hybrid,
+                "mean_recovery": mean_recovery,
             }
         )
     return {"cells": cells}
-
-
-# Canonical HKVD strategy used for the GO gate. We picked ``hkvd_gradual``
-# (CacheBlend Fig. 9 multi-layer narrowing filter) over the simpler
-# ``hkvd_first_layer`` because the 50-instance 1B sweep showed it dominates
-# at every r — most notably at r=0.05 (0.725 vs 0.516) and r=0.20 (0.817 vs
-# 0.776). Both at r=0.50 are tied (~0.945). Update this if a future variant
-# beats it on the same comparable-budget basis.
-GO_STRATEGY = "hkvd_gradual"
-
-
-def _decision(summary: dict) -> str:
-    """Three independent gates per plan.md Phase 5.4:
-
-    * **GO** — ``GO_STRATEGY`` @ r=15% mean recovery ≥ 0.90 (validates the
-      strategy we're trusting). Pinned to the canonical HKVD variant so a
-      sweep that includes both ``hkvd`` and ``hkvd_gradual`` doesn't fall
-      back to whichever name happens to be listed first.
-    * **NO-GO** — even the best strategy at r=50% fails to recover ≥ 0.50;
-      means the task is too hard for any selection budget or the stale-path
-      implementation is broken. Tested on best-of, not any-of: random often
-      sits below 0.5 at r=50% by itself, that alone isn't a sweep problem.
-    * **Weak signal** — random @ r=15% already ≥ 0.90; task too easy to
-      stress cross-chunk attention.
-
-    Missing cells (e.g. trimmed r grid) yield ``INCONCLUSIVE`` rather than
-    silently being treated as NOT-GO.
-    """
-    by_cell = {(c["strategy"], c["r"]): c for c in summary["cells"]}
-    go_015 = by_cell.get((GO_STRATEGY, 0.15), {}).get("mean_recovery")
-    random_015 = by_cell.get(("random", 0.15), {}).get("mean_recovery")
-    r50_by_strategy = {
-        c["strategy"]: c["mean_recovery"]
-        for c in summary["cells"]
-        if c["r"] == 0.50 and c["mean_recovery"] is not None
-    }
-
-    flags: list[str] = []
-
-    # Gate 1: GO — does the canonical HKVD strategy reach 0.90 at r=15%.
-    if go_015 is None:
-        flags.append(f"INCONCLUSIVE: no {GO_STRATEGY} @ r=0.15 cell in sweep.")
-    elif go_015 >= 0.90:
-        flags.append(f"GO: {GO_STRATEGY} @ r=15% mean recovery {go_015:.3f} ≥ 0.90.")
-    else:
-        flags.append(f"NOT-GO: {GO_STRATEGY} @ r=15% mean recovery {go_015:.3f} < 0.90.")
-
-    # Gate 2: NO-GO — best-of-strategies at r=50% can't clear 0.50.
-    if r50_by_strategy:
-        best_s, best_v = max(r50_by_strategy.items(), key=lambda kv: kv[1])
-        if best_v < 0.50:
-            cells_str = ", ".join(f"{s}={v:.3f}" for s, v in sorted(r50_by_strategy.items()))
-            flags.append(
-                f"NO-GO: best r=50% recovery {best_v:.3f} (from {best_s}) < 0.50 "
-                f"({cells_str}) — task too hard or stale-path implementation may be broken."
-            )
-
-    # Gate 3: weak-signal warning — task too easy.
-    if random_015 is not None and random_015 >= 0.90:
-        flags.append(
-            f"WEAK SIGNAL: random @ r=15% already recovers {random_015:.3f} ≥ 0.90 "
-            "— task may not stress cross-chunk attention."
-        )
-
-    return "\n".join(flags)
 
 
 def _write_summary(path: Path, rows: list[dict], run_path: Path, elapsed_s: float) -> None:
@@ -230,7 +179,7 @@ def _write_summary(path: Path, rows: list[dict], run_path: Path, elapsed_s: floa
                 **cell, rec=rec_s
             )
         )
-    lines.extend(["", "## Decision", "", _decision(summary), ""])
+    lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
