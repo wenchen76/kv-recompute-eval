@@ -1,9 +1,13 @@
 """Run the Phase 5 selective-recompute sweep.
 
-Default grid matches ``plan.md`` Phase 5:
+Default grid (extends ``plan.md`` Phase 5 with the gradual HKVD variant):
 
-    strategy in {random, first_r, hkvd}
+    strategy in {random, first_r, hkvd, hkvd_gradual}
     r in {0.0, 0.05, 0.10, 0.15, 0.20, 0.50, 1.0}
+
+``hkvd`` is the simplified single-layer HKVD baseline; ``hkvd_gradual``
+implements CacheBlend Fig. 9's per-layer narrowing filter. Both are kept
+side by side so the sweep can compare them.
 
 The runner writes an append-only JSONL file plus summary artifacts under
 ``results/``. It reuses per-instance gold/stale prefix caches so the sweep does
@@ -38,7 +42,7 @@ from src.selection import select_positions
 
 
 DEFAULT_R_VALUES = [0.0, 0.05, 0.10, 0.15, 0.20, 0.50, 1.0]
-DEFAULT_STRATEGIES = ["random", "first_r", "hkvd"]
+DEFAULT_STRATEGIES = ["random", "first_r", "hkvd", "hkvd_gradual"]
 
 
 def _ppl(nll: float) -> float:

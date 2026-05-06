@@ -81,26 +81,33 @@ def concat_per_chunk_kvs(
 def mix_kv(
     kv_gold: DynamicCache,
     kv_stale: DynamicCache,
-    selected_positions: Set[int],
+    selected_positions: Set[int] | Sequence[Set[int]],
     model_config,
 ) -> DynamicCache:
-    """Build a hybrid prefix cache: positions in ``selected_positions`` sourced
-    from ``kv_gold``, everything else from ``kv_stale``. Shared selection across
-    all layers (per Phase 3 simplified HKVD — paper insight that early-layer
-    divergence ranking correlates well with later layers).
+    """Build a hybrid prefix cache: per-position pick between ``kv_gold`` and
+    ``kv_stale``, optionally with a different selection at every layer.
+
+    Two call shapes:
+
+    * ``selected_positions: Set[int]`` — uniform across layers (used by
+      ``random`` / ``first_r`` / ``hkvd`` strategies). Same set applied to
+      every layer of the cache.
+    * ``selected_positions: Sequence[Set[int]]`` of length ``n_layers`` —
+      per-layer (used by ``hkvd_gradual``: layer i takes its own selection
+      that's a subset of layer i-1's). The sequence MUST be exactly
+      ``model_config.num_hidden_layers`` long; index ``i`` is the selection
+      applied at layer i.
 
     Sanity endpoints (Phase 3 tests assert these):
-    * empty selection → output is bit-equal to ``kv_stale``,
-    * full selection → output is bit-equal to ``kv_gold``.
+    * empty selection (every layer) → output bit-equal to ``kv_stale``,
+    * full selection (every layer) → output bit-equal to ``kv_gold``.
 
     Args:
         kv_gold: full gold prefix cache (prefill on cat(sys, chunks)).
         kv_stale: stale prefix cache (concat of per-chunk prefills).
             Must cover the same sequence range as ``kv_gold``.
-        selected_positions: global positions in ``[0, prefix_len)`` drawn from
-            gold. Positions in the sys range are a no-op since sys KV is
-            identical under both paths (sys has no prior context to attend to),
-            but they're accepted — the caller doesn't have to special-case sys.
+        selected_positions: see above. Positions in the sys range are no-ops
+            since sys KV is identical under both paths.
         model_config: model.config, for n_layers.
 
     Returns:
@@ -113,21 +120,34 @@ def mix_kv(
     L = L_gold
     n_layers = model_config.num_hidden_layers
 
-    device = kv_gold.key_cache[0].device
-    mask = torch.zeros(L, dtype=torch.bool, device=device)
-    if selected_positions:
-        idx_list = sorted(selected_positions)
-        assert idx_list[0] >= 0 and idx_list[-1] < L, (
-            f"mix_kv: selected positions out of range [0, {L}): "
-            f"min={idx_list[0]}, max={idx_list[-1]}"
+    # Normalize to per-layer list. set/frozenset → replicate; otherwise it's
+    # already a sequence and must match n_layers exactly.
+    if isinstance(selected_positions, (set, frozenset)):
+        per_layer: Sequence[Set[int]] = [selected_positions] * n_layers
+    else:
+        per_layer = list(selected_positions)
+        assert len(per_layer) == n_layers, (
+            f"mix_kv: per-layer selection length {len(per_layer)} != "
+            f"n_layers {n_layers}"
         )
-        idx = torch.tensor(idx_list, dtype=torch.long, device=device)
-        mask[idx] = True
-    # [1, 1, L, 1] broadcasts against K/V [B, n_kv_heads, L, head_dim].
-    mask_b = mask.view(1, 1, L, 1)
 
+    device = kv_gold.key_cache[0].device
     merged = DynamicCache()
     for li in range(n_layers):
+        sel = per_layer[li]
+        # Build this layer's mask. Cheap (boolean of length L) and lets each
+        # layer pick a different subset.
+        mask = torch.zeros(L, dtype=torch.bool, device=device)
+        if sel:
+            idx_list = sorted(sel)
+            assert idx_list[0] >= 0 and idx_list[-1] < L, (
+                f"mix_kv layer {li}: selected positions out of range [0, {L}): "
+                f"min={idx_list[0]}, max={idx_list[-1]}"
+            )
+            idx = torch.tensor(idx_list, dtype=torch.long, device=device)
+            mask[idx] = True
+        mask_b = mask.view(1, 1, L, 1)
+
         kg, vg = kv_gold.key_cache[li], kv_gold.value_cache[li]
         ks, vs = kv_stale.key_cache[li], kv_stale.value_cache[li]
         assert kg.shape == ks.shape, (

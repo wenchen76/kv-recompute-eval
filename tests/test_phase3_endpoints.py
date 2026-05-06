@@ -28,7 +28,7 @@ from src.experiment import run_gold, run_hybrid, run_stale
 from tests.fixtures import DEV_INSTANCE
 
 
-STRATEGIES = ["random", "first_r", "hkvd"]
+STRATEGIES = ["random", "first_r", "hkvd", "hkvd_gradual"]
 
 
 @pytest.fixture(scope="module")
