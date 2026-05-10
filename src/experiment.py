@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import torch
 
-from src.cache_ops import concat_per_chunk_kvs, mix_kv
+from src.cache_ops import (
+    cacheblend_recompute,
+    cacheblend_recompute_gradual,
+    concat_per_chunk_kvs,
+)
 from src.metrics import compute_answer_ppl
 from src.prefill import online_prefill, prefill_chunk, prefill_gold
 from src.selection import select_positions
@@ -106,23 +110,26 @@ def run_hybrid(
     r: float,
     seed: int = 0,
 ) -> float:
-    """Hybrid path (Phase 3):
+    """Hybrid path (real CacheBlend selective recompute):
 
     1. Build the stale prefix cache (sys + chunks) — same as ``run_stale`` steps 1–3.
-    2. Build the gold prefix cache over the same (sys + chunks) span.
+    2. Build the gold prefix cache over the same (sys + chunks) span (used by HKVD
+       selection only — never substituted into the hybrid cache).
     3. Select positions within the chunk range via ``strategy`` / ``r``.
-    4. Mix: selected positions come from gold, rest from stale → hybrid prefix.
+    4. Recompute K/V at selected positions layer-by-layer via
+       ``cacheblend_recompute``: each layer's attention reads from the merged
+       cache (fresh K/V at this layer's selected positions + stale elsewhere).
+       Non-selected positions keep stale K/V at every layer. This is the
+       approximation CacheBlend actually deploys — quality at a given r is what
+       this path measures.
     5. Online-prefill ``query[:, :-1]`` on top of the hybrid prefix.
     6. Score the answer with the held-back last query token.
 
     Endpoint invariants (asserted in Phase 3 tests):
-    * ``r=0`` → empty selection → hybrid == stale → ppl_hybrid == ppl_stale.
-    * ``r=1`` → full selection → hybrid == gold → ppl_hybrid == ppl_gold.
-
-    Note: step 2 builds the full gold prefix so ``select_hkvd_first_layer`` can
-    read layer-1 K divergence. For strategies that don't need it (``random`` /
-    ``first_r``) this is wasted work, but Phase 3 lives on a single dev instance
-    and correctness beats micro-optimization here.
+    * ``r=0`` → empty selection → no recompute → hybrid == stale (bit-equal).
+    * ``r=1`` → full chunk selection → recompute matches full prefill within
+      attention-implementation numerical noise (gold uses SDPA, recompute uses
+      eager math). ppl_hybrid ≈ ppl_gold within ``PPL_TOL``.
     """
     assert query_ids.shape[-1] >= 1, "run_hybrid: need at least one query token"
 
@@ -147,19 +154,32 @@ def run_hybrid(
     full_prefix_ids = torch.cat([sys_ids, *chunk_ids_list], dim=-1)
     kv_prefix_gold = prefill_gold(model, full_prefix_ids)
 
-    # Step 3: selection — positions restricted to chunk range.
-    selected = select_positions(
-        strategy,
-        r,
-        chunk_range=chunk_range,
-        chunk_offsets=chunk_offsets,
-        kv_gold=kv_prefix_gold,
-        kv_stale=kv_prefix_stale,
-        seed=seed,
-    )
-
-    # Step 4: mix.
-    kv_prefix_hybrid = mix_kv(kv_prefix_gold, kv_prefix_stale, selected, model.config)
+    # Step 3-4: selective recompute on top of the stale prefix. ``hkvd_gradual``
+    # uses the dynamic-deviation variant where selection is interleaved with
+    # the layer-by-layer forward; the other strategies pre-select a static
+    # plan and feed it to the static recompute.
+    if strategy == "hkvd_gradual":
+        kv_prefix_hybrid = cacheblend_recompute_gradual(
+            model,
+            full_prefix_ids,
+            kv_prefix_stale,
+            chunk_range,
+            r,
+            model.config,
+        )
+    else:
+        selected = select_positions(
+            strategy,
+            r,
+            chunk_range=chunk_range,
+            chunk_offsets=chunk_offsets,
+            kv_gold=kv_prefix_gold,
+            kv_stale=kv_prefix_stale,
+            seed=seed,
+        )
+        kv_prefix_hybrid = cacheblend_recompute(
+            model, full_prefix_ids, kv_prefix_stale, selected, model.config
+        )
 
     # Step 5: online prefill query except last token.
     query_prefill_ids = query_ids[:, :-1]

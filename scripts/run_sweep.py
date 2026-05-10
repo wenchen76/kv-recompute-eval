@@ -33,7 +33,11 @@ if str(ROOT) not in sys.path:
 import matplotlib.pyplot as plt
 import torch
 
-from src.cache_ops import concat_per_chunk_kvs, mix_kv
+from src.cache_ops import (
+    cacheblend_recompute,
+    cacheblend_recompute_gradual,
+    concat_per_chunk_kvs,
+)
 from src.config import DEVICE, DTYPE, MODEL_ID, load_model_and_tokenizer
 from src.data import load_jsonl_instances, tokenize_instance
 from src.metrics import compute_answer_ppl
@@ -79,7 +83,11 @@ def _build_prefix_state(model, tok: dict) -> dict:
         "prefix_end": pos,
         "chunk_range": (sys_len, pos),
         "chunk_offsets": chunk_offsets,
+        "full_prefix_ids": full_prefix_ids,
         "kv_prefix_stale": concat_per_chunk_kvs([kv_sys, *kv_chunks], model.config),
+        # Used by HKVD selection only — never substituted into the hybrid
+        # cache. The hybrid is built by ``cacheblend_recompute``, which
+        # actually re-runs the model layer-by-layer at selected positions.
         "kv_prefix_gold": prefill_gold(model, full_prefix_ids),
     }
 
@@ -259,21 +267,32 @@ def main() -> None:
         for strategy in args.strategies:
             for r in args.r_values:
                 cell_started = time.perf_counter()
-                selected = select_positions(
-                    strategy,
-                    r,
-                    chunk_range=prefix_state["chunk_range"],
-                    chunk_offsets=prefix_state["chunk_offsets"],
-                    kv_gold=prefix_state["kv_prefix_gold"],
-                    kv_stale=prefix_state["kv_prefix_stale"],
-                    seed=args.seed,
-                )
-                kv_hybrid = mix_kv(
-                    prefix_state["kv_prefix_gold"],
-                    prefix_state["kv_prefix_stale"],
-                    selected,
-                    model.config,
-                )
+                if strategy == "hkvd_gradual":
+                    kv_hybrid = cacheblend_recompute_gradual(
+                        model,
+                        prefix_state["full_prefix_ids"],
+                        prefix_state["kv_prefix_stale"],
+                        prefix_state["chunk_range"],
+                        r,
+                        model.config,
+                    )
+                else:
+                    selected = select_positions(
+                        strategy,
+                        r,
+                        chunk_range=prefix_state["chunk_range"],
+                        chunk_offsets=prefix_state["chunk_offsets"],
+                        kv_gold=prefix_state["kv_prefix_gold"],
+                        kv_stale=prefix_state["kv_prefix_stale"],
+                        seed=args.seed,
+                    )
+                    kv_hybrid = cacheblend_recompute(
+                        model,
+                        prefix_state["full_prefix_ids"],
+                        prefix_state["kv_prefix_stale"],
+                        selected,
+                        model.config,
+                    )
                 nll_hybrid = _score_from_prefix(
                     model, tok, kv_hybrid, prefix_state["prefix_end"]
                 )
