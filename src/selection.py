@@ -1,8 +1,8 @@
 """Position-selection strategies for the hybrid cache (Phase 3).
 
 Each strategy returns a set of **global** positions in the sys+chunks prefix
-index space; those positions are recomputed by ``cacheblend_recompute``, the
-rest stay stale. Sys positions are never selected — sys KV is identical
+index space; ``cacheblend_recompute`` uses that set after the shared layer-1
+full-chunk warmup. Sys positions are never selected — sys KV is identical
 under both paths, so it's a no-op either way and it keeps the selection
 scope honest.
 
@@ -12,7 +12,7 @@ scope honest.
   forward needed; cheap.
 * ``select_hkvd_first_layer`` — top-r% by layer-1 K-divergence. Simplified
   CacheBlend (paper observation: early-layer divergence ranking correlates
-  highly with later layers, so one shared selection across layers works).
+  highly with later layers, so one shared selection works for layers 2+).
 
 The CacheBlend Fig. 9 gradual variant (``hkvd_gradual``) is **not** dispatched
 through this module any more — its ranking signal is the per-layer
@@ -95,8 +95,9 @@ def select_hkvd_first_layer(
     to ``sqrt(‖ΔK‖² + ‖ΔV‖²)``; K usually dominates magnitude but V picks up
     "attention pattern correct, output value off" cases that K alone misses,
     which matter more in deeper layers (V's relative magnitude grows with
-    depth). Same selection reused across all layers (paper insight: early-
-    layer ranking correlates with later layers).
+    depth). The selected set is reused for layers 2+ after the shared layer-1
+    full-chunk warmup (paper insight: early-layer ranking correlates with later
+    layers).
 
     **Why layer 1, not layer 0**: layer 0's K and V are pure functions of
     the token embedding and global position (no attention has happened yet),

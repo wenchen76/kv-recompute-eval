@@ -2,16 +2,17 @@
 
 For all three strategies:
 
-* ``r=0`` → selection is empty → ``mix_kv`` returns a copy of the stale prefix
-  → the whole hybrid path is numerically equivalent to ``run_stale``.
-* ``r=1`` → selection covers every chunk position → ``mix_kv`` returns a copy
-  of the gold prefix. The hybrid path is then equivalent to "full gold prefix +
+* ``r=0`` → selection is empty → ``cacheblend_recompute`` returns a copy of
+  the stale prefix → the whole hybrid path is numerically equivalent to
+  ``run_stale``.
+* ``r=1`` → selection covers every chunk position → recompute refreshes the
+  full chunk prefix. The hybrid path is then equivalent to "full gold prefix +
   online-prefilled query", which is what ``run_gold`` does, just split into two
   forwards instead of one.
 
-Both are free sanity gates for ``mix_kv`` (direction of torch.where), selection
-rounding at the endpoints, and the run_hybrid wiring. Failure here points to
-a swap of gold/stale args or a rounding bug (``r=1`` missing the last position).
+Both are free sanity gates for selection rounding at the endpoints, recompute
+writeback, and the run_hybrid wiring. Failure here points to stale/fresh
+writeback bugs or a rounding bug (``r=1`` missing the last position).
 
 Tolerance is ``PPL_TOL`` (1e-4 fp32 / 1e-2 bf16). r=0 should be bit-exact; r=1
 can differ by a tiny amount because the gold path is split (prefix forward +
@@ -47,7 +48,7 @@ def test_r0_equals_stale(loaded_model, dev_tok, strategy):
     assert nll_hybrid == pytest.approx(nll_stale, abs=PPL_TOL), (
         f"r=0 ({strategy}): hybrid NLL {nll_hybrid:.6f} != stale {nll_stale:.6f}, "
         f"diff {abs(nll_hybrid - nll_stale):.2e}. Empty selection should make "
-        "mix_kv a no-op copy of the stale prefix."
+        "recompute a no-op copy of the stale prefix."
     )
 
 
@@ -62,6 +63,6 @@ def test_r1_equals_gold(loaded_model, dev_tok, strategy):
         f"r=1 ({strategy}): hybrid NLL {nll_hybrid:.6f} != gold {nll_gold:.6f}, "
         f"diff {abs(nll_hybrid - nll_gold):.2e}. Full selection should make the "
         "hybrid prefix bit-equal to the gold prefix; any mismatch past fp noise "
-        "means selection rounding dropped a position or mix_kv has gold/stale "
-        "swapped."
+        "means selection rounding dropped a position or recompute wrote stale "
+        "values where fresh K/V were expected."
     )

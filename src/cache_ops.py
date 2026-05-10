@@ -2,13 +2,12 @@
 
 * ``concat_per_chunk_kvs`` — assemble the stale prefix cache by concatenating
   per-chunk DynamicCache objects along the sequence dimension (Phase 2).
-* ``mix_kv`` — *oracle* hybrid: positions in ``selected_positions`` sourced
-  directly from gold KV, everything else from stale. Used as an upper bound
-  on selective-recompute quality (it pretends the recompute is lossless).
 * ``cacheblend_recompute`` — *real* CacheBlend selective recompute with a
   static plan: layer-by-layer forward whose attention reads from the merged
   cache (fresh K/V at already-recomputed positions in this layer + stale K/V
-  everywhere else). Predicts true CacheBlend quality at a fixed selection.
+  everywhere else). When given a chunk range, layers 0 and 1 process the full
+  chunk range before narrowing to the fixed selection, matching the gradual
+  path's first-ranking-layer cost.
 * ``cacheblend_recompute_gradual`` — dynamic-deviation gradual variant of
   the above (paper Fig. 9). Selection is fully interleaved with recompute:
   layers 0 and 1 process the full chunk range, the layer-1 forward
@@ -91,90 +90,6 @@ def concat_per_chunk_kvs(
     return merged
 
 
-def mix_kv(
-    kv_gold: DynamicCache,
-    kv_stale: DynamicCache,
-    selected_positions: Set[int] | Sequence[Set[int]],
-    model_config,
-) -> DynamicCache:
-    """Build a hybrid prefix cache: per-position pick between ``kv_gold`` and
-    ``kv_stale``, optionally with a different selection at every layer.
-
-    Two call shapes:
-
-    * ``selected_positions: Set[int]`` — uniform across layers (used by
-      ``random`` / ``first_r`` / ``hkvd`` strategies). Same set applied to
-      every layer of the cache.
-    * ``selected_positions: Sequence[Set[int]]`` of length ``n_layers`` —
-      per-layer (used by ``hkvd_gradual``: layer i takes its own selection
-      that's a subset of layer i-1's). The sequence MUST be exactly
-      ``model_config.num_hidden_layers`` long; index ``i`` is the selection
-      applied at layer i.
-
-    Sanity endpoints (Phase 3 tests assert these):
-    * empty selection (every layer) → output bit-equal to ``kv_stale``,
-    * full selection (every layer) → output bit-equal to ``kv_gold``.
-
-    Args:
-        kv_gold: full gold prefix cache (prefill on cat(sys, chunks)).
-        kv_stale: stale prefix cache (concat of per-chunk prefills).
-            Must cover the same sequence range as ``kv_gold``.
-        selected_positions: see above. Positions in the sys range are no-ops
-            since sys KV is identical under both paths.
-        model_config: model.config, for n_layers.
-
-    Returns:
-        DynamicCache with per-layer K,V of the shared prefix_len. Deep copy
-        (via torch.where); mutating the result does not alias the inputs.
-    """
-    L_gold = kv_gold.get_seq_length()
-    L_stale = kv_stale.get_seq_length()
-    assert L_gold == L_stale, f"mix_kv: gold len {L_gold} != stale len {L_stale}"
-    L = L_gold
-    n_layers = model_config.num_hidden_layers
-
-    # Normalize to per-layer list. set/frozenset → replicate; otherwise it's
-    # already a sequence and must match n_layers exactly.
-    if isinstance(selected_positions, (set, frozenset)):
-        per_layer: Sequence[Set[int]] = [selected_positions] * n_layers
-    else:
-        per_layer = list(selected_positions)
-        assert len(per_layer) == n_layers, (
-            f"mix_kv: per-layer selection length {len(per_layer)} != "
-            f"n_layers {n_layers}"
-        )
-
-    device = kv_gold.key_cache[0].device
-    merged = DynamicCache()
-    for li in range(n_layers):
-        sel = per_layer[li]
-        # Build this layer's mask. Cheap (boolean of length L) and lets each
-        # layer pick a different subset.
-        mask = torch.zeros(L, dtype=torch.bool, device=device)
-        if sel:
-            idx_list = sorted(sel)
-            assert idx_list[0] >= 0 and idx_list[-1] < L, (
-                f"mix_kv layer {li}: selected positions out of range [0, {L}): "
-                f"min={idx_list[0]}, max={idx_list[-1]}"
-            )
-            idx = torch.tensor(idx_list, dtype=torch.long, device=device)
-            mask[idx] = True
-        mask_b = mask.view(1, 1, L, 1)
-
-        kg, vg = kv_gold.key_cache[li], kv_gold.value_cache[li]
-        ks, vs = kv_stale.key_cache[li], kv_stale.value_cache[li]
-        assert kg.shape == ks.shape, (
-            f"layer {li}: gold K shape {tuple(kg.shape)} != stale {tuple(ks.shape)}"
-        )
-        assert vg.shape == vs.shape, (
-            f"layer {li}: gold V shape {tuple(vg.shape)} != stale {tuple(vs.shape)}"
-        )
-        merged.key_cache.append(torch.where(mask_b, kg, ks))
-        merged.value_cache.append(torch.where(mask_b, vg, vs))
-    merged._seen_tokens = L
-    return merged
-
-
 @torch.no_grad()
 def cacheblend_recompute(
     model,
@@ -182,21 +97,26 @@ def cacheblend_recompute(
     kv_stale: DynamicCache,
     selected_positions: Set[int],
     model_config,
+    *,
+    chunk_range: tuple[int, int] | None = None,
 ) -> DynamicCache:
     """Real CacheBlend selective recompute with a static plan.
 
-    For each selected position, run a layer-by-layer forward where
-    attention reads from the *merged* cache: fresh K/V at the selected
-    positions (just-recomputed this layer) + stale K/V everywhere else.
-    Non-selected positions keep their stale K/V untouched at every layer.
-    The same selection set is applied to every layer.
+    For each selected position, run a layer-by-layer forward where attention
+    reads from the *merged* cache: fresh K/V at the selected positions
+    (just-recomputed this layer) + stale K/V everywhere else.
+
+    If ``chunk_range`` is supplied, layers 0 and 1 forward the full chunk
+    range, matching ``cacheblend_recompute_gradual``. Layer 1 writes fresh K/V
+    for every chunk position, then later layers narrow back to
+    ``selected_positions``. This keeps static strategies comparable with the
+    gradual strategy when they are swept together.
 
     This reproduces CacheBlend's actual approximation error: at layer ℓ
     the recomputed h_i^(ℓ) is the output of attention over a stale-
     polluted cache, so the resulting k_i^(ℓ), v_i^(ℓ) are *not* equal to
     the full-prefill values. Errors compound across layers exactly as the
-    paper acknowledges. Contrast with ``mix_kv``, which substitutes
-    gold K/V directly and so upper-bounds the achievable quality.
+    paper acknowledges.
 
     Endpoints:
 
@@ -215,13 +135,17 @@ def cacheblend_recompute(
             (``cat(sys, *chunks)``). Length must match ``kv_stale``.
         kv_stale: stale prefix cache from ``concat_per_chunk_kvs``.
         selected_positions: global positions whose K/V should be
-            recomputed at every layer.
+            recomputed after the layer-1 full-chunk warmup.
         model_config: ``model.config``.
+        chunk_range: optional ``(start, end)`` global chunk-token span. When
+            set, layer 1 is recomputed for this full range regardless of the
+            static selection.
 
     Returns:
-        DynamicCache of length ``L``. Position ``i`` has fresh K/V at
-        every layer iff ``i ∈ selected_positions``; otherwise stale K/V
-        at every layer.
+        DynamicCache of length ``L``. With ``chunk_range``, layer 1 has fresh
+        K/V for all chunk positions, while layers 2+ have fresh K/V only at
+        ``selected_positions``. Without ``chunk_range``, the historical static
+        behavior is preserved.
     """
     L = kv_stale.get_seq_length()
     assert full_prefix_ids.shape[-1] == L, (
@@ -230,8 +154,8 @@ def cacheblend_recompute(
     )
     n_layers = model_config.num_hidden_layers
 
-    # Always start from a deep copy of stale; at every layer we overwrite
-    # the K/V for selected positions only.
+    # Always start from a deep copy of stale; recompute overwrites selected
+    # positions, plus the full chunk range at layer 1 when requested.
     merged = DynamicCache()
     for li in range(n_layers):
         merged.key_cache.append(kv_stale.key_cache[li].clone())
@@ -249,22 +173,24 @@ def cacheblend_recompute(
 
     device = full_prefix_ids.device
     dtype = kv_stale.key_cache[0].dtype
+    selected_set = set(sel_list)
+
+    layer1_full_set: set[int] = set()
+    if chunk_range is not None:
+        chunk_start, chunk_end = chunk_range
+        assert 0 <= chunk_start <= chunk_end <= L, (
+            f"cacheblend_recompute: chunk_range {chunk_range} out of range [0, {L}]"
+        )
+        layer1_full_set = set(range(chunk_start, chunk_end))
+
+    # To produce layer-1 K/V for the full chunk range, layer 0 must also
+    # forward those positions so their layer-1 inputs exist. After layer 1,
+    # the static path narrows back to the strategy-selected positions.
+    active_list = sorted(selected_set | layer1_full_set)
+    active_idx = torch.tensor(active_list, dtype=torch.long, device=device)
     sel_idx = torch.tensor(sel_list, dtype=torch.long, device=device)
-    S = sel_idx.numel()
-
-    # Embed selected tokens and prep RoPE (cos/sin shared across layers
-    # because the selected set is fixed).
-    h = model.model.embed_tokens(full_prefix_ids.index_select(1, sel_idx))
-    sel_pos_ids = sel_idx.unsqueeze(0)
-    cos, sin = model.model.rotary_emb(h, sel_pos_ids)
-
-    # Causal mask: token at S-index s (with global pos sel_idx[s]) attends
-    # to cache positions [0, sel_idx[s]]. Built once, reused per layer.
+    h = model.model.embed_tokens(full_prefix_ids.index_select(1, active_idx))
     cache_pos = torch.arange(L, device=device)
-    can_attend = cache_pos.unsqueeze(0) <= sel_idx.unsqueeze(1)  # [S, L]
-    additive = torch.zeros((S, L), dtype=dtype, device=device)
-    additive.masked_fill_(~can_attend, torch.finfo(dtype).min)
-    additive = additive.view(1, 1, S, L)
 
     n_q_heads = model_config.num_attention_heads
     n_kv_heads = model_config.num_key_value_heads
@@ -275,18 +201,35 @@ def cacheblend_recompute(
     scaling = head_dim ** -0.5
 
     for li, layer in enumerate(model.model.layers):
+        S_cur = active_idx.numel()
+        sel_pos_ids = active_idx.unsqueeze(0)
+        cos, sin = model.model.rotary_emb(h, sel_pos_ids)
+        can_attend = cache_pos.unsqueeze(0) <= active_idx.unsqueeze(1)
+        additive = torch.zeros((S_cur, L), dtype=dtype, device=device)
+        additive.masked_fill_(~can_attend, torch.finfo(dtype).min)
+        additive = additive.view(1, 1, S_cur, L)
+
         residual = h
         h_ln = layer.input_layernorm(h)
         attn = layer.self_attn
         B = h_ln.shape[0]
 
-        q = attn.q_proj(h_ln).view(B, S, n_q_heads, head_dim).transpose(1, 2)
-        k = attn.k_proj(h_ln).view(B, S, n_kv_heads, head_dim).transpose(1, 2)
-        v = attn.v_proj(h_ln).view(B, S, n_kv_heads, head_dim).transpose(1, 2)
+        q = attn.q_proj(h_ln).view(B, S_cur, n_q_heads, head_dim).transpose(1, 2)
+        k = attn.k_proj(h_ln).view(B, S_cur, n_kv_heads, head_dim).transpose(1, 2)
+        v = attn.v_proj(h_ln).view(B, S_cur, n_kv_heads, head_dim).transpose(1, 2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        merged.key_cache[li].index_copy_(2, sel_idx, k)
-        merged.value_cache[li].index_copy_(2, sel_idx, v)
+        write_set = selected_set
+        if li == 1 and layer1_full_set:
+            write_set = selected_set | layer1_full_set
+        write_idx = torch.tensor(sorted(write_set), dtype=torch.long, device=device)
+        write_local = torch.searchsorted(active_idx, write_idx)
+        merged.key_cache[li].index_copy_(
+            2, write_idx, k.index_select(2, write_local)
+        )
+        merged.value_cache[li].index_copy_(
+            2, write_idx, v.index_select(2, write_local)
+        )
 
         K_full = repeat_kv(merged.key_cache[li], n_rep)
         V_full = repeat_kv(merged.value_cache[li], n_rep)
@@ -296,7 +239,7 @@ def cacheblend_recompute(
         attn_w = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
         attn_out = torch.matmul(attn_w, V_full)
         attn_out = attn_out.transpose(1, 2).contiguous().view(
-            B, S, n_q_heads * head_dim
+            B, S_cur, n_q_heads * head_dim
         )
         attn_out = attn.o_proj(attn_out)
 
@@ -305,6 +248,11 @@ def cacheblend_recompute(
         h = layer.post_attention_layernorm(h)
         h = layer.mlp(h)
         h = residual + h
+
+        if li == 1 and layer1_full_set and li + 1 < n_layers:
+            keep_local = torch.searchsorted(active_idx, sel_idx)
+            active_idx = sel_idx
+            h = h[:, keep_local, :]
 
     return merged
 
@@ -320,54 +268,29 @@ def cacheblend_recompute_gradual(
     *,
     start_scale: float = 1.2,
 ) -> DynamicCache:
-    """Dynamic-deviation gradual selective recompute (paper Fig. 9 spirit),
-    in a form that maps cleanly onto vLLM-style production deployment.
+    """Dynamic CacheBlend recompute with gradual per-layer narrowing.
 
-    **No precomputed full-prefill cache input.** The layer-1 ranking
-    signal that earlier variants borrowed from a precomputed full-prefill
-    layer-1 cache is recovered here by simply forwarding all chunk tokens
-    through layers 0–1 — that forward already produces fresh layer-1 K/V
-    at every chunk position, and ‖fresh − stale‖ at layer 1 is
-    numerically equivalent to the layer-1 full-prefill-vs-stale signal
-    (because at layer 1 the recompute output matches what full prefill
-    would compute on chunk positions). This is the only ranking signal
-    production CacheBlend can afford; obtaining a precomputed full-prefill
-    cache at any layer would require having already done the very
-    prefill we are trying to avoid.
+    This is the production-shaped ``hkvd_gradual`` path: it does not take a
+    precomputed gold/full-prefill cache. Instead, it derives each ranking signal
+    from the fresh K/V produced by the recompute itself:
+    ``deviation = norm(fresh_kv - stale_kv)``.
 
-    Algorithm:
+    The current live position set is ``R``. It starts as the full chunk range.
+    Layer 0 forwards all chunk tokens but does not write K/V back, because
+    layer-0 K/V depends only on token and position. From layer 1 onward, each
+    layer writes fresh K/V at ``R``, ranks those positions by fresh-vs-stale
+    deviation, runs attention and MLP for all positions in ``R``, then narrows
+    the layer output to form the next layer's input set.
 
-    1. ``R = full chunk range`` (all ``n_total`` positions). Embed the
-       chunk tokens.
-    2. **Layer 0**: forward over all chunk tokens. No K/V writeback —
-       layer-0 K/V is a pure function of token+position so stale already
-       equals fresh up to fp noise.
-    3. **Layer 1**: forward over all chunk tokens. Write fresh K/V at
-       *every* chunk position into the merged cache (the layer is forced
-       to do this work anyway to produce the deviation signal, so we
-       keep the K/V — layer-1 cache then matches what full prefill would
-       compute on chunks, at zero extra compute). Compute
-       ``d_1 = ‖fresh − stale‖_layer1`` across all chunk positions, then
-       narrow ``R`` to the top ``sched_k(0)`` by ``d_1`` for layer 2.
-    4. **Layer ℓ ∈ [2, L-1]**:
-       - Forward over ``R``. Write fresh K/V at ``R``.
-       - Compute ``d_ℓ`` at ``R``.
-       - If ℓ < L-1: narrow ``R`` to top ``sched_k(ℓ-1)`` by ``d_ℓ``.
-
-    Schedule applies to layers 2..L-1 (``n_narrowed = n_layers - 2``
-    entries): symmetric linear from ``start_scale * r * n_total`` at
-    layer 2 to ``(2 - start_scale) * r * n_total`` at layer L-1, so the
-    mean keep size over those narrowed layers is ``r * n_total``. Layers
-    0 and 1 always process the full chunk range — that cost is the price
-    of the layer-1 ranking signal in production.
+    The keep schedule applies to layers 2..L-1. It linearly moves from
+    ``start_scale * r * n_total`` to ``(2 - start_scale) * r * n_total``, so
+    the average keep size across narrowed layers is ``r * n_total``. Layer 1
+    always processes the full chunk range to produce the first deviation signal.
 
     Endpoints:
-
-    * ``r = 0`` → ``k_target = 0`` → returns clone of stale (skip
-      recompute entirely; we do not even pay layer-1 forward cost).
-    * ``r = 1`` → ``k_target = n_total`` → defer to ``cacheblend_recompute``
-      with the full chunk set; matches a full prefill within numerical
-      noise.
+    * ``r = 0`` returns a clone of the stale cache without recompute.
+    * ``r = 1`` defers to static full-chunk recompute for exact endpoint
+      behavior.
 
     Args:
         model: ``LlamaForCausalLM``-compatible. Reads ``embed_tokens``,
@@ -385,9 +308,10 @@ def cacheblend_recompute_gradual(
             ``[1.0, 2.0]``. Default ``1.2``.
 
     Returns:
-        ``DynamicCache`` of length ``L``. Layer 1 has fresh K/V at every
-        chunk position; deeper layers have fresh K/V on the dynamically
-        narrowed subset; sys positions stay stale at every layer.
+        ``DynamicCache`` of length ``L``. Layer 1 has fresh K/V for all chunk
+        positions; deeper layers have fresh K/V for the dynamically narrowed
+        subset. Sys positions remain stale because they are already identical
+        under stale and full-prefill paths.
     """
     L = kv_stale.get_seq_length()
     assert full_prefix_ids.shape[-1] == L, (
@@ -403,11 +327,10 @@ def cacheblend_recompute_gradual(
     n_total = end - start
 
     def _k(ratio: float) -> int:
-        # Same rounding rule as src.selection._k_from_r — duplicated here
-        # to keep cache_ops independent of selection's private API.
+        # Match src.selection._k_from_r without depending on a private helper.
         return max(0, min(int(round(ratio * n_total)), n_total))
 
-    # Initialize merged cache (clone of stale).
+    # Start from stale and overwrite only positions that are recomputed.
     merged = DynamicCache()
     for li in range(n_layers):
         merged.key_cache.append(kv_stale.key_cache[li].clone())
@@ -421,17 +344,20 @@ def cacheblend_recompute_gradual(
     if k_target == 0:
         return merged
     if k_target == n_total:
-        # r → 1 fast path: full chunk set at every layer. Defer to the
-        # static recompute so we don't hit the schedule's
-        # ``min(1, scale * r)`` clamp asymmetry that would otherwise drop
-        # ``k_ℓ`` below ``n_total`` at the tail of the ramp.
+        # Preserve the r=1 endpoint exactly; the gradual schedule would otherwise
+        # shrink at the low end of the symmetric ramp.
         full_set = set(range(start, end))
         return cacheblend_recompute(
-            model, full_prefix_ids, kv_stale, full_set, model_config
+            model,
+            full_prefix_ids,
+            kv_stale,
+            full_set,
+            model_config,
+            chunk_range=chunk_range,
         )
 
     end_scale = 2.0 - start_scale
-    # Schedule covers layers 2..L-1; round 0 ↔ layer 2.
+    # Round 0 chooses the keep set for layer 2; the final round targets L-1.
     n_narrowed = max(1, n_layers - 2)
 
     def sched_k(round_idx: int) -> int:
@@ -445,9 +371,8 @@ def cacheblend_recompute_gradual(
     device = full_prefix_ids.device
     dtype = kv_stale.key_cache[0].dtype
 
-    # Start with the full chunk range. Layers 0 and 1 process every chunk
-    # token; the layer-1 forward both produces the ranking signal and
-    # populates layer-1 cache fresh-everywhere on chunks.
+    # R is the current live chunk-position set. It shrinks after layer 1 and
+    # may shrink again after each later non-final layer.
     R = torch.arange(start, end, dtype=torch.long, device=device).contiguous()
     h = model.model.embed_tokens(full_prefix_ids.index_select(1, R))
 
@@ -465,7 +390,8 @@ def cacheblend_recompute_gradual(
         if S_cur == 0:
             break
 
-        # Rebuild RoPE + causal mask each layer because R can shrink.
+        # R can shrink between layers, so RoPE positions and the causal mask are
+        # rebuilt for the current live set.
         sel_pos_ids = R.unsqueeze(0)
         cos, sin = model.model.rotary_emb(h, sel_pos_ids)
         can_attend = cache_pos.unsqueeze(0) <= R.unsqueeze(1)  # [S_cur, L]
@@ -484,21 +410,23 @@ def cacheblend_recompute_gradual(
 
         d_layer: torch.Tensor | None = None
         if li > 0:
-            # Layer ≥ 1: write fresh K/V into cache at R. At layer 1, R is
-            # still the full chunk range (no narrowing yet) — that is the
-            # "renew layer-1 cache so it matches a full prefill on chunks"
-            # At layer ≥ 2, R is the dynamically narrowed subset.
+            # Commit fresh K/V for this layer. At layer 1, R is
+            # still the full chunk range; at deeper layers, it is the previous
+            # layer's survivors.
             merged.key_cache[li].index_copy_(2, R, k)
             merged.value_cache[li].index_copy_(2, R, v)
 
+            # Rank the current live positions by the deviation just produced by
+            # this layer's recompute.
             stale_k = kv_stale.key_cache[li].index_select(2, R)
             stale_v = kv_stale.value_cache[li].index_select(2, R)
             dk = (k - stale_k).float().pow(2).sum(dim=(0, 1, 3))
             dv = (v - stale_v).float().pow(2).sum(dim=(0, 1, 3))
             d_layer = (dk + dv).sqrt()
-        # Layer 0: skip writeback — layer-0 K/V is a pure function of
-        # token + position, so stale already equals fresh up to fp noise.
+        # Layer 0 has no useful deviation signal and no K/V writeback.
 
+        # Attention reads from the merged full-prefix cache for every position
+        # currently in R.
         K_full = repeat_kv(merged.key_cache[li], n_rep)
         V_full = repeat_kv(merged.value_cache[li], n_rep)
         scores = torch.matmul(q, K_full.transpose(-1, -2)) * scaling
@@ -510,17 +438,19 @@ def cacheblend_recompute_gradual(
         )
         attn_out = attn.o_proj(attn_out)
 
+        # Finish this layer for every position in R before choosing which layer
+        # outputs continue to the next layer.
         h = residual + attn_out
         residual = h
         h = layer.post_attention_layernorm(h)
         h = layer.mlp(h)
         h = residual + h
 
-        # Narrow R for the next layer (li + 1). Narrowing applies to
-        # layers 2..L-1, so we narrow when li ∈ [1, L-2]. The schedule
-        # round for the next layer is ``round_idx = (li + 1) - 2 = li - 1``.
-        if li + 1 < n_layers and li >= 1 and d_layer is not None:
-            round_idx = li - 1  # next layer = li+1; round 0 corresponds to layer 2
+        # Narrow after the layer output. The selected h rows are exactly the
+        # input states for the next layer; K/V already written at the wider R
+        # remains in this layer's cache.
+        if li >= 1 and li + 1 < n_layers and d_layer is not None:
+            round_idx = li - 1
             k_next = min(sched_k(round_idx), S_cur)
             if k_next < S_cur:
                 keep_local = torch.topk(d_layer, k_next).indices.sort().values

@@ -5,20 +5,19 @@ interval (closed, with fp tolerance):
 
     ppl_gold  <=  ppl_hybrid  <=  ppl_stale
 
-Above ``ppl_stale`` means we paid for gold K/Vs but the mix hurt the model —
-strong signal that ``mix_kv`` flipped gold/stale or selection ranking was
-inverted. Below ``ppl_gold`` is basically impossible unless one of the runs
-is wrong.
+Above ``ppl_stale`` means we paid recompute cost but the hybrid hurt the model
+— strong signal that recompute writeback or selection ranking is inverted.
+Below ``ppl_gold`` is basically impossible unless one of the runs is wrong.
 
 No strict recovery-ratio bound here: on the 1B dev model the gap between
 gold and stale is small (see Phase 2 multi-chunk test), so the HKVD win is
 close to noise. Recovery ratio is printed for observability; the real go/no-go
 is the Phase 5 sweep on 8B. This test is correctness-only.
 
-Parametrized over both HKVD variants — adding ``hkvd_gradual`` here keeps
-the per-layer ``mix_kv`` path under the same correctness gate as the single-
-layer ``hkvd``. If gradual breaks ``r=0`` / ``r=1`` invariants or inverts
-ranking, this surfaces it before the Phase 5 sweep.
+Parametrized over both HKVD variants — adding ``hkvd_gradual`` here keeps the
+dynamic recompute path under the same correctness gate as the static ``hkvd``.
+If gradual breaks ``r=0`` / ``r=1`` invariants or inverts ranking, this surfaces
+it before the Phase 5 sweep.
 """
 from __future__ import annotations
 
@@ -69,7 +68,7 @@ def test_hkvd_middle_r_monotonic(loaded_model, strategy):
     assert ppl_hybrid <= ppl_stale + tol, (
         f"{strategy} @ r={R}: ppl_hybrid={ppl_hybrid:.4f} > ppl_stale={ppl_stale:.4f} "
         f"(tol {tol:.2e}). Hybrid worse than pure stale means the mix is "
-        "hurting — check gold/stale arg order or the sign of the HKVD ranking."
+        "hurting — check recompute writeback or the sign of the HKVD ranking."
     )
     assert ppl_hybrid >= ppl_gold - tol, (
         f"{strategy} @ r={R}: ppl_hybrid={ppl_hybrid:.4f} < ppl_gold={ppl_gold:.4f} "

@@ -116,12 +116,12 @@ def run_hybrid(
     2. Build the gold prefix cache over the same (sys + chunks) span (used by HKVD
        selection only — never substituted into the hybrid cache).
     3. Select positions within the chunk range via ``strategy`` / ``r``.
-    4. Recompute K/V at selected positions layer-by-layer via
-       ``cacheblend_recompute``: each layer's attention reads from the merged
-       cache (fresh K/V at this layer's selected positions + stale elsewhere).
-       Non-selected positions keep stale K/V at every layer. This is the
-       approximation CacheBlend actually deploys — quality at a given r is what
-       this path measures.
+    4. Recompute K/V via ``cacheblend_recompute``: static strategies first run
+       the full chunk range through layer 1 (same comparison cost as gradual),
+       then layers 2+ narrow to the selected positions. Each layer's attention
+       reads from the merged cache (fresh K/V at this layer's recomputed
+       positions + stale elsewhere). This is the approximation CacheBlend
+       actually deploys — quality at a given r is what this path measures.
     5. Online-prefill ``query[:, :-1]`` on top of the hybrid prefix.
     6. Score the answer with the held-back last query token.
 
@@ -178,7 +178,12 @@ def run_hybrid(
             seed=seed,
         )
         kv_prefix_hybrid = cacheblend_recompute(
-            model, full_prefix_ids, kv_prefix_stale, selected, model.config
+            model,
+            full_prefix_ids,
+            kv_prefix_stale,
+            selected,
+            model.config,
+            chunk_range=chunk_range,
         )
 
     # Step 5: online prefill query except last token.

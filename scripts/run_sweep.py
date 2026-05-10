@@ -87,7 +87,8 @@ def _build_prefix_state(model, tok: dict) -> dict:
         "kv_prefix_stale": concat_per_chunk_kvs([kv_sys, *kv_chunks], model.config),
         # Used by HKVD selection only — never substituted into the hybrid
         # cache. The hybrid is built by ``cacheblend_recompute``, which
-        # actually re-runs the model layer-by-layer at selected positions.
+        # re-runs the model and shares the layer-1 full-chunk warmup across
+        # static strategies.
         "kv_prefix_gold": prefill_gold(model, full_prefix_ids),
     }
 
@@ -97,8 +98,8 @@ def _score_from_prefix(model, tok: dict, prefix_kv, prefix_end: int) -> float:
     """Score answer NLL after online-prefilling query[:-1] over a prefix cache.
 
     Mutates ``prefix_kv`` (online_prefill appends to its per-layer lists in
-    place). Caller owns ownership: pass a freshly-allocated cache (e.g. one
-    just returned by ``mix_kv``) or ``copy.deepcopy(...)`` of a shared cache.
+    place). Caller owns ownership: pass a freshly-allocated cache from
+    recompute or ``copy.deepcopy(...)`` of a shared cache.
     Doing the deepcopy at the call site lets us skip it when the cache is
     already exclusive to this scoring call (saves ~21 deepcopies per instance).
     """
@@ -246,7 +247,7 @@ def main() -> None:
         prefix_state = _build_prefix_state(model, tok)
 
         # Deepcopy for gold/stale scoring: kv_prefix_gold and kv_prefix_stale
-        # are reused across every (strategy, r) cell below (selection + mix_kv),
+        # are reused across every (strategy, r) cell below,
         # and _score_from_prefix mutates its argument by appending query KV.
         # kv_hybrid below is fresh-per-cell so it doesn't need deepcopy.
         nll_gold = _score_from_prefix(
@@ -292,6 +293,7 @@ def main() -> None:
                         prefix_state["kv_prefix_stale"],
                         selected,
                         model.config,
+                        chunk_range=prefix_state["chunk_range"],
                     )
                 nll_hybrid = _score_from_prefix(
                     model, tok, kv_hybrid, prefix_state["prefix_end"]
